@@ -41,7 +41,7 @@ if (!defined('WHMCS')) {
  * installed by copying one directory, so a shared file is a file the reseller does not copy);
  * the test is what stops the copies drifting.
  */
-const ZINN_STACKS = 'headless_cms,nextcloud,node,one_click,owncloud,php,static,woocommerce,wordpress';
+const ZINN_STACKS = 'dotnet,headless_cms,nextcloud,node,one_click,owncloud,php,php_app,python,ruby,static,woocommerce,wordpress';
 
 require_once __DIR__ . '/lib/Client.php';
 
@@ -200,10 +200,14 @@ function zinn_sitePayload(
  * @param array<string,mixed> $params WHMCS module parameters.
  * @return string 'success' or an error message.
  */
-function zinn_CreateAccount(array $params): string
+function zinn_CreateAccount(array $params, ?Client $client = null): string
 {
     try {
-        $client = Client::fromParams($params);
+        // ⭐ Injectable like the button handlers below, and for the reason D17702 records:
+        // an entry point that mints its own client can only be exercised by making a real
+        // HTTP call, so the one function where the money is was the one function no test
+        // could run. D18630 lived behind exactly that.
+        $client = $client ?? Client::fromParams($params);
         $serviceId = (string) $params['serviceid'];
 
         $existing = zinn_storedSiteId($params);
@@ -316,16 +320,41 @@ function zinn_UnsuspendAccount(array $params): string
  * @param array<string,mixed> $params WHMCS module parameters.
  * @return string
  */
-function zinn_TerminateAccount(array $params): string
+function zinn_TerminateAccount(array $params, ?Client $client = null): string
 {
     try {
         $site = zinn_requireSiteId($params);
-        $client = Client::fromParams($params);
+        $client = $client ?? Client::fromParams($params);
         try {
             $row = $client->get('/v1/reseller/services/' . rawurlencode($site), []);
         } catch (Throwable $e) {
-            // Gone already, or never ours. Either way there is nothing left to terminate,
-            // and reporting failure would jam WHMCS's cancellation queue.
+            // ⛔⛔ ONLY A 404 MEANS GONE, AND READING EVERY FAILURE AS "GONE" DELETED NOTHING
+            // WHILE REPORTING SUCCESS (D18633). This branch used to catch everything, on the
+            // reasoning that reporting failure would jam WHMCS's cancellation queue — right
+            // about a 404 and wrong about every other answer. Measured live on 2026-09-02: a
+            // transient `502` on this lookup made WHMCS mark the service **Terminated**, the
+            // reseller stopped billing their client, and the site kept running on a wholesale
+            // line that kept being invoiced — with the id that could have found it erased in
+            // the same breath.
+            //
+            // ⭐ §2.44's twin, exactly: the ambiguous answer read in the reassuring
+            // direction. "I could not ask" is not "there is nothing there", and a
+            // cancellation is the one operation where guessing wrong costs money for ever.
+            if ((int) $e->getCode() !== 404) {
+                return $e->getMessage();
+            }
+            // Gone already, or never ours. Nothing left to terminate; forget the dead handle
+            // so a re-order provisions afresh (D18632).
+            zinn_forgetSiteId($params);
+            return 'success';
+        }
+        // ⛔⛔ A DELETED SITE IS STILL LISTED, so "gone" is ALSO a 200 with `status: deleted`
+        // (measured live 2026-10-05, Q48): the service lookup answers 200 and `DELETE
+        // /v1/sites/{id}` then answers 404 — so a reseller cancelling in WHMCS after the site
+        // was deleted elsewhere got "does not exist" and the service stuck Active. The tests
+        // modelled "gone" as a 404 on the lookup only, which is not what the platform says.
+        if (($row['status'] ?? '') === 'deleted') {
+            zinn_forgetSiteId($params);
             return 'success';
         }
         $domain = trim((string) ($row['primary_domain'] ?? ''));
@@ -334,6 +363,17 @@ function zinn_TerminateAccount(array $params): string
                 . 'deletion could not be confirmed. Nothing has been changed.';
         }
         $client->delete('/v1/sites/' . rawurlencode($site), ['confirm_domain' => $domain]);
+        // ⛔⛔ THE ID GOES WITH THE SITE, AND LEAVING IT IS D18630 ONE STEP ALONG (D18632).
+        // WHMCS keeps the service row after a termination, so an admin re-activating a
+        // returning client presses **Create** on the same service — and while the dead id
+        // is still recorded, create's own "already provisioned" guard fires, returns
+        // `success`, provisions nothing and marks the service Active. Every later action
+        // then 404s against a site that was deleted.
+        //
+        // ⭐ Nothing is lost by clearing it: WHMCS has no `_UnterminateAccount`, so after
+        // this call the only module operation that can reach the service is a fresh create,
+        // and a fresh create is exactly what it should do.
+        zinn_forgetSiteId($params);
         return 'success';
     } catch (Throwable $e) {
         return $e->getMessage();
@@ -543,12 +583,50 @@ function zinn_clientOrg(Client $client, array $params): string
  * module is self-describing rather than depending on a table that could be lost in a
  * restore.
  *
+ * ⛔⛔ AND WHMCS PUTS ITS OWN VALUE THERE FIRST, WHICH IS WHY THIS IS A SHAPE TEST AND NOT
+ * `!== ''` (D18630, measured inside WHMCS 9.0.7 on 2026-09-02). Before dispatching
+ * `_CreateAccount` for a product that requires a server, WHMCS generates a username and a
+ * password from the client's details and writes them to `tblhosting` — so the very first
+ * create arrives with `$params['username'] = 'whmcstes'`, an emptiness test says *already
+ * provisioned*, `zinn_CreateAccount` returns `success` without calling the platform at all,
+ * and WHMCS marks the service **Active**. The reseller bills their client, no site exists,
+ * and nothing at either end reports it.
+ *
+ * ⭐ Nothing outside a real WHMCS could see this. `PanelStubs.php` reaches every line of
+ * every entry point, and its fixture says `'username' => ''` — which is what a WHMCS
+ * `$params` looks like to whoever writes one by hand, and what it never looks like on the
+ * call that matters. The test was a third expression of the author's intent (§2.24).
+ *
+ * ⭐ A Zinn site id is a UUID and a WHMCS-generated username is eight alphanumerics, so the
+ * two are separable by shape with nothing to keep in sync. This deliberately does NOT move
+ * the mapping into a module table: the self-describing property above is worth keeping, and
+ * a second table is a second thing a restore can lose.
+ *
  * @param array<string,mixed> $params WHMCS module parameters.
  * @return string
  */
 function zinn_storedSiteId(array $params): string
 {
-    return trim((string) ($params['username'] ?? ''));
+    $value = trim((string) ($params['username'] ?? ''));
+    return zinn_isSiteId($value) ? $value : '';
+}
+
+/**
+ * Whether a value is a Zinn site id rather than something the panel put there.
+ *
+ * ⛔ Every id the platform issues is a UUID (`uuid7`), and every panel-generated username is
+ * a short alphanumeric handle. The test is on the id's own format, so it needs no list of
+ * what panels generate and cannot rot as they change.
+ *
+ * @param string $value Candidate value.
+ * @return bool
+ */
+function zinn_isSiteId(string $value): bool
+{
+    return (bool) preg_match(
+        '/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i',
+        $value
+    );
 }
 
 /**
@@ -580,6 +658,23 @@ function zinn_storeSiteId(array $params, string $siteId): void
     Capsule::table('tblhosting')
         ->where('id', (int) $params['serviceid'])
         ->update(['username' => $siteId]);
+}
+
+/**
+ * Forget the Zinn site id recorded against this WHMCS service.
+ *
+ * ⛔ Called when the site it names no longer exists. The module's whole memory of a service
+ * is this one field, and a stale value in it is indistinguishable from a live one — which is
+ * the shape of both D18630 and D18632.
+ *
+ * @param array<string,mixed> $params WHMCS module parameters.
+ * @return void
+ */
+function zinn_forgetSiteId(array $params): void
+{
+    Capsule::table('tblhosting')
+        ->where('id', (int) $params['serviceid'])
+        ->update(['username' => '']);
 }
 
 /**
@@ -1171,6 +1266,14 @@ function zinn_ListAccounts(array $params, ?Client $client = null): array
                     // ⛔ WHMCS's own vocabulary, not ours. It matches an imported account to
                     // a service by this word, and an unrecognised one is silently skipped.
                     'status' => ($row['status'] ?? '') === 'suspended' ? 'Suspended' : 'Active',
+                    // ⛔⛔ WHMCS'S OWN IMPORT SCREEN CRASHES WITHOUT THIS (D18638). Its
+                    // `SyncItem::getCreated()` runs `Carbon::createFromFormat('Y-m-d H:i:s',
+                    // $created)` with no null check, so a row that omits the key takes the
+                    // whole **Sync Accounts** page to a 500 — a WHMCS stack trace, not our
+                    // message, and no import at all. Measured inside WHMCS 9.0.7 by pressing
+                    // the button; unreachable from any test that does not have WHMCS's view
+                    // layer, which is every test we had.
+                    'created' => zinn_whmcsDate($row['created_at'] ?? null),
                 ];
             }
             $cursor = (string) ($page['page']['next_cursor'] ?? '');
@@ -1179,6 +1282,27 @@ function zinn_ListAccounts(array $params, ?Client $client = null): array
     } catch (Throwable $e) {
         return ['success' => false, 'error' => $e->getMessage()];
     }
+}
+
+/**
+ * A timestamp in the format WHMCS parses, from the platform's ISO 8601.
+ *
+ * ⛔ Always returns something parseable. WHMCS feeds this straight to
+ * `Carbon::createFromFormat('Y-m-d H:i:s', …)` with no null check, so "no date" is not an
+ * option the caller has — the choice is between a value and a 500 on the import screen.
+ *
+ * ⭐ An unreadable date becomes the Unix epoch rather than "now". A placeholder that is
+ * obviously not a real creation date is a bad row an admin can spot; today's date on an
+ * account created last year is a plausible lie, and those are the ones nobody catches.
+ *
+ * @param mixed $isoDate The platform's `created_at`, or null.
+ * @return string
+ */
+function zinn_whmcsDate($isoDate): string
+{
+    $text = trim((string) ($isoDate ?? ''));
+    $stamp = $text === '' ? false : strtotime($text);
+    return gmdate('Y-m-d H:i:s', $stamp === false ? 0 : $stamp);
 }
 
 /**

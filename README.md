@@ -73,25 +73,40 @@ connection test is not evidence that an order will succeed.
 Create it in your Zinn® dashboard under **API keys**, and give it only what this module
 needs:
 
-| Permission           | Why                                                                              |
-| -------------------- | -------------------------------------------------------------------------------- |
-| `org.create`         | **Create a client account on the first order.**                                  |
-| `org.read`           | Read your client accounts.                                                       |
-| `sites.create`       | Provision a site.                                                                |
-| `sites.view`         | Read a service.                                                                  |
-| `sites.delete`       | Terminate.                                                                       |
-| `reseller.view`      | List your services and read usage.                                               |
-| `reseller.provision` | Suspend, release, sign a client in, **set their plan and change their package**. |
-| `sites.manage`       | Purge cache, take a backup, change a WordPress password.                         |
-| `sites.panel_access` | Set the WordPress administrator's password from the client area.                 |
-| `hosting.php.manage` | Switch PHP version on an upgrade or downgrade.                                   |
-| `billing.view`       | Read what an upgrade costs before performing it.                                 |
+| Permission              | Why                                                                              |
+| ----------------------- | -------------------------------------------------------------------------------- |
+| `org.create`            | **Create a client account on the first order.**                                  |
+| `sites.create`          | Provision a site.                                                                |
+| `sites.view`            | Read a service, its PHP version and its backups.                                 |
+| `sites.delete`          | Terminate.                                                                       |
+| `reseller.view`         | List your services, read usage, read a package before changing it.               |
+| `reseller.provision`    | Suspend, release, sign a client in, **set their plan and change their package**. |
+| `sites.cache.purge`     | The Purge Cache buttons.                                                         |
+| `hosting.backup.manage` | The Take Backup buttons.                                                         |
+| `sites.panel_access`    | Read the WordPress users and set the administrator's password.                   |
+| `hosting.php.manage`    | Switch PHP version on an upgrade or downgrade.                                   |
 
-> ⛔⛔ **This table is a claim about the key, and it has been wrong twice.** It omitted
-> `org.create` until 2026-08-31 and the last four rows until 2026-09-01 — and a key missing
-> any of them still passes **Test Connection**, because that call reads your programme and
-> provisions nothing. What you get instead is a `403` on the one operation the missing
-> permission covers, months later, from a customer. **Grant the whole table.**
+> ⛔⛔ **This table is a claim about the key, it has been wrong three times, and it is now the
+> only one nobody has to maintain by hand.** It omitted `org.create` until 2026-08-31
+> (`403` on the first order), four more rows until 2026-09-01, and until 2026-09-02 it named
+> **`sites.manage`, which is not a permission this platform has** — so a key minted from the
+> table as written was refused outright, and a reseller who worked around that by dropping
+> the row silently lost cache purging and backups (D18634).
+>
+> ⭐ **It is now derived, not written.** `engine/api/tests/test_integration_module_permissions.py`
+> reads every `(method, path)` this module calls out of `zinn.php`, resolves each against the
+> live URL map, asks the real view which permissions it enforces, and fails if this table is
+> not exactly that set — in **both** directions, so an over-granted row is caught as well as a
+> missing one. It also counts the call sites in the file, so an extractor that goes blind fails
+> loudly instead of quietly agreeing.
+>
+> ⛔ A key missing any of these still passes **Test Connection**, because that call reads your
+> programme and provisions nothing. What you get instead is a `403` on the one operation the
+> missing permission covers, months later, from a customer. **Grant the whole table.**
+>
+> ⚠️ `org.read` and `billing.view` were listed here until 2026-09-02 and no call in this module
+> needs either. They are removed rather than kept "just in case": this key can create and
+> destroy a client's hosting, and a row nothing uses is reach nobody audits.
 
 > ⛔ **`org.create` is not optional and this table omitted it until 2026-08-31.** A key
 > granted exactly the six permissions listed before passes **Test Connection** — that call
